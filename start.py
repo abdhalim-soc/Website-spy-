@@ -1,10 +1,13 @@
-# Multi-Target Web Vulnerability & Sensitive Data Scanner
-# Supports single URL, multiple comma-separated URLs, or a file containing URLs (one per line).
-# Usage:
-#   python scanner.py <target_url>
-#   python scanner.py <url1>,<url2>,<url3>
-#   python scanner.py --target-file targets.txt [--depth 2] [--threads 10]
-# Requirements: requests, beautifulsoup4, lxml
+# ==============================================================
+#  FULL-FEATURED WEB VULNERABILITY & SENSITIVE DATA SCANNER
+#  Compact code, complete functionality:
+#  - SQL Injection, XSS, LFI, Open Redirect detection
+#  - Sensitive file exposure & admin panel enumeration
+#  - Extraction of emails, API keys, passwords, hidden inputs, SSN, credit cards
+#  - Multi-threaded with configurable thread count
+#  Usage: python scanner.py <target> [--threads N]
+#  target can be URL (http(s)://...) or IP[:port]
+# ==============================================================
 
 import sys
 import re
@@ -14,7 +17,6 @@ from bs4 import BeautifulSoup
 import threading
 import queue
 import time
-import os
 import random
 
 # ---------- CONFIGURATION ----------
@@ -23,9 +25,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Version/14.1.1 Safari/537.36",
 ]
 TIMEOUT = 8
-MAX_DEPTH = 2
-THREADS = 10
-OUTPUT_FILE = "scan_results.txt"  # will be appended with target index for multi-target
+THREADS = 10  # default, overridden by --threads
+OUTPUT_FILE = "scan_results.txt"
 SENSITIVE_FILES = [
     ".env", ".git/config", "wp-config.php", "config.php", "database.yml",
     "admin.php", "phpinfo.php", "backup.sql", "dump.sql", "credentials.txt"
@@ -47,21 +48,14 @@ SENSITIVE_PATTERNS = {
     "credit_card": r"\b(?:\d{4}[ -]?){3}\d{4}\b"
 }
 
-# ---------- GLOBAL STATE PER TARGET ----------
-# Resets for each target
+# ---------- GLOBAL STATE ----------
 url_queue = queue.Queue()
 visited_urls = set()
 vulnerabilities = []
 extracted_data = {"emails": set(), "phones": set(), "api_keys": set(), "passwords": set(), "hidden_inputs": {}, "ssn": set(), "credit_cards": set()}
 lock = threading.Lock()
-target_host = ""
-
-def reset_global_state():
-    global url_queue, visited_urls, vulnerabilities, extracted_data
-    url_queue = queue.Queue()
-    visited_urls.clear()
-    vulnerabilities.clear()
-    extracted_data = {"emails": set(), "phones": set(), "api_keys": set(), "passwords": set(), "hidden_inputs": {}, "ssn": set(), "credit_cards": set()}
+TARGET_BASE = ""   # scheme://netloc with optional port
+TARGET_HOST = ""   # netloc only
 
 def random_agent():
     return random.choice(USER_AGENTS)
@@ -77,7 +71,7 @@ def make_request(url, params=None, cookies=None, method="GET", data=None, allow_
     except requests.RequestException:
         return None
 
-# ---------- CORE SCANNING FUNCTIONS (unchanged except for allow_redirects in scan_open_redirect) ----------
+# ---------- CORE SCANNING ----------
 def scan_sql_injection(url, param):
     sqli_errors = [
         "SQL syntax", "mysql_fetch", "ORA-", "PostgreSQL", "Unclosed quotation mark",
@@ -100,7 +94,7 @@ def scan_sql_injection(url, param):
     return vulnerable
 
 def scan_xss(url, param):
-    test_payload = "<scrIpt>alert(1)</scrIpt>"  # mixed case
+    test_payload = "<scrIpt>alert(1)</scrIpt>"
     test_url = url + "?" + param + "=" + urllib.parse.quote(test_payload)
     resp = make_request(test_url)
     if resp and test_payload in resp.text:
@@ -170,7 +164,8 @@ def extract_sensitive_data(html, source_url):
                     getattr(extracted_data[category], 'add')(match)
 
 def crawl_page(url, depth):
-    if depth > MAX_DEPTH or url in visited_urls:
+    # Single-page scan: no recursion, depth ignored
+    if url in visited_urls:
         return
     with lock:
         visited_urls.add(url)
@@ -179,17 +174,7 @@ def crawl_page(url, depth):
         return
     html = resp.text
     soup = BeautifulSoup(html, "lxml")
-    # Extract links
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-        full_link = urllib.parse.urljoin(url, href)
-        if full_link.startswith(("http://", "https://")) and not full_link.startswith("javascript:"):
-            # Only crawl links within the same target host
-            if urllib.parse.urlparse(full_link).netloc == target_host:
-                with lock:
-                    if full_link not in visited_urls:
-                        url_queue.put((full_link, depth+1))
-    # Extract forms
+    # Extract forms and parameters
     forms = soup.find_all("form")
     for form in forms:
         action = form.get("action", "")
@@ -206,8 +191,9 @@ def crawl_page(url, depth):
             scan_xss(action_url, param)
             scan_lfi(action_url, param)
             scan_open_redirect(action_url, param)
+    # Extract sensitive data from this page
     extract_sensitive_data(html, url)
-    # Perform file and admin checks only at root depth
+    # Check sensitive files / admin panels only for the root request
     if depth == 0:
         parsed = urllib.parse.urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
@@ -224,16 +210,39 @@ def worker():
         crawl_page(url, depth)
         url_queue.task_done()
 
-# ---------- TARGET SCAN ORCHESTRATOR ----------
-def scan_target(target_url, index=1):
-    global target_host
-    reset_global_state()
-    parsed = urllib.parse.urlparse(target_url)
-    target_host = parsed.netloc
-    if not target_host:
-        print(f"[-] Invalid URL: {target_url}")
-        return
-    print(f"\n[=== SCANNING TARGET {index}: {target_url} ===]")
+# ---------- MAIN ----------
+def main():
+    global THREADS, TARGET_BASE, TARGET_HOST
+    if len(sys.argv) < 2:
+        print("Usage: python scanner.py <target> [--threads N]")
+        print("  target: URL (http(s)://...) or IP[:port]")
+        sys.exit(1)
+
+    target_input = sys.argv[1]
+    # Parse optional --threads
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--threads" and i+1 < len(sys.argv):
+            THREADS = int(sys.argv[i+1])
+            i += 2
+        else:
+            i += 1
+
+    # Normalize target: if no scheme, prepend http://
+    if not target_input.startswith(('http://', 'https://')):
+        target_input = 'http://' + target_input
+    parsed = urllib.parse.urlparse(target_input)
+    if not parsed.netloc:
+        print("[-] Invalid target: no host")
+        sys.exit(1)
+    TARGET_BASE = f"{parsed.scheme}://{parsed.netloc}"
+    TARGET_HOST = parsed.netloc
+    target_url = target_input.rstrip('/')
+
+    print(f"[*] Target: {target_url}")
+    print(f"[*] Threads: {THREADS}")
+
+    # Start scanning
     start_time = time.time()
     url_queue.put((target_url, 0))
     threads = []
@@ -245,12 +254,12 @@ def scan_target(target_url, index=1):
     url_queue.join()
     for t in threads:
         t.join(timeout=1)
-    # Results
-    print(f"\n[+] Scan completed for {target_url}")
-    print("[+] Vulnerabilities found:")
+
+    # Output results
+    print("\n[+] Vulnerabilities found:")
     for vuln in vulnerabilities:
         print(f"  - {vuln}")
-    print("\n[+] Extracted Sensitive Data:")
+    print("\n[+] Extracted Sensitive Data (truncated):")
     for cat, data in extracted_data.items():
         if cat == "hidden_inputs":
             for page, inputs in data.items():
@@ -258,15 +267,10 @@ def scan_target(target_url, index=1):
         else:
             if data:
                 print(f"  {cat}: {', '.join(list(data)[:20])}")
-    # Save to file (append if multiple targets)
-    save_results(target_url, index)
-    elapsed = time.time() - start_time
-    print(f"[*] Elapsed: {elapsed:.2f} sec\n")
 
-def save_results(target_url, index):
-    # Use a suffix per target to avoid overwrites
-    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', target_url.strip())
-    out_file = f"scan_{index}_{safe_name}.txt"
+    # Save full report
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', target_url)
+    out_file = f"scan_{safe_name}.txt"
     with open(out_file, "w", encoding="utf-8") as f:
         f.write(f"===== SCAN REPORT FOR {target_url} =====\n\n")
         f.write("===== VULNERABILITIES =====\n")
@@ -280,65 +284,8 @@ def save_results(target_url, index):
             else:
                 for item in items:
                     f.write(f"  {item}\n")
-    print(f"[*] Detailed results saved to {out_file}")
-
-def load_targets_from_file(filepath):
-    targets = []
-    try:
-        with open(filepath, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    targets.append(line)
-    except Exception as e:
-        print(f"[-] Error reading target file: {e}")
-        sys.exit(1)
-    return targets
-
-def main():
-    # Parse arguments to support:
-    # 1. python scanner.py single_url
-    # 2. python scanner.py url1,url2,url3
-    # 3. python scanner.py --target-file targets.txt [--depth X] [--threads Y]
-    global MAX_DEPTH, THREADS
-    targets = []
-    i = 1
-    while i < len(sys.argv):
-        arg = sys.argv[i]
-        if arg == "--target-file":
-            if i+1 < len(sys.argv):
-                filepath = sys.argv[i+1]
-                targets.extend(load_targets_from_file(filepath))
-                i += 2
-            else:
-                print("[-] --target-file requires a path")
-                sys.exit(1)
-        elif arg == "--depth":
-            if i+1 < len(sys.argv):
-                MAX_DEPTH = int(sys.argv[i+1])
-                i += 2
-        elif arg == "--threads":
-            if i+1 < len(sys.argv):
-                THREADS = int(sys.argv[i+1])
-                i += 2
-        elif not arg.startswith("--"):
-            # Could be a URL or a comma-separated list of URLs
-            if ',' in arg:
-                targets.extend([u.strip() for u in arg.split(",") if u.strip()])
-            else:
-                targets.append(arg)
-            i += 1
-        else:
-            i += 1  # unknown flag, skip
-    if not targets:
-        print("Usage: python scanner.py <target_url> [,<url2>,...] | --target-file <file> [--depth 2] [--threads 10]")
-        sys.exit(1)
-    print(f"[*] Loaded {len(targets)} target(s).")
-    for idx, target in enumerate(targets, start=1):
-        # Ensure URL has scheme
-        if not target.startswith(('http://', 'https://')):
-            target = 'https://' + target
-        scan_target(target, idx)
+    elapsed = time.time() - start_time
+    print(f"\n[*] Scan finished in {elapsed:.2f} sec. Full results saved to {out_file}")
 
 if __name__ == "__main__":
     main()
